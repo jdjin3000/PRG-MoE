@@ -1,6 +1,6 @@
 # Conversational Emotion-Cause Pair Extraction with Guided Mixture of Experts
 
-This repository is the official implementation of [Conversational Emotion-Cause Pair Extraction with Guided Mixture of Experts](https://arxiv.org/abs/2030.12345). 
+This repository is the official implementation of [Conversational Emotion-Cause Pair Extraction with Guided Mixture of Experts]. 
 
 ## Dependencies
 
