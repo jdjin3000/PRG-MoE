@@ -20,6 +20,9 @@ python main.py
 ```
 We describes the meaning of arguments in ```main.py```.
 
+## Dataset
+The dataset used in this paper is RECCON dataset. See [this link](https://github.com/declare-lab/RECCON) for more information.
+
 ## Citation
 
 TBD
