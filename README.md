@@ -2,6 +2,8 @@
 
 This repository is the official implementation of [Conversational Emotion-Cause Pair Extraction with Guided Mixture of Experts]. 
 
+![model_v5_2](https://user-images.githubusercontent.com/57910677/218022327-6bf55a88-d780-40a5-b2c8-878361567a32.png)
+
 ## Dependencies
 
 - Python 3.9.7
