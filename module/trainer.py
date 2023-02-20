@@ -1,22 +1,40 @@
-from numpy import hamming
-from .preprocessing import *
-import module.model as M
-from .evaluation import *
-import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
-from tqdm import tqdm
-import logging, datetime
-import sklearn
+import logging
+import os
+import datetime
 
-import os, sys
+import torch
+import torch.optim as optim
+from tqdm import tqdm
+from torch.utils.data import TensorDataset, DataLoader
+
+import module.model as M
+from module.evaluation import log_metrics, FocalLoss
+from module.preprocessing import get_data, tokenize_conversation
+
 os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 
-class learning_env:
-    def __init__(self, gpus, train_data, valid_data, test_data, split_directory, max_seq_len, log_directory, model_name, port, contain_context, data_label, **kwargs) -> None:
+class LearningEnv:
+    def __init__(
+        self, 
+        gpus, 
+        train_data, 
+        valid_data, 
+        test_data, 
+        split_directory, 
+        max_seq_len, 
+        log_directory, 
+        model_name, 
+        port, 
+        contain_context, 
+        data_label, 
+        **kwargs,
+    ):
         self.gpus = gpus
-        self.single_gpu = True if len(self.gpus) == 1 else False
+        self.single_gpu = len(self.gpus) == 1
 
-        self.train_dataset, self.valid_dataset, self.test_dataset = train_data, valid_data, test_data
+        self.train_dataset = train_data
+        self.valid_dataset = valid_data
+        self.test_dataset = test_data
 
         self.split_directory = split_directory
         self.split_num = None
@@ -36,39 +54,57 @@ class learning_env:
 
         self.data_label = data_label
 
-        self.best_performance = [0, 0, 0] # p, r, f1
+        self.best_performance = [0, 0, 0]  # p, r, f1
 
-
-    def __set_model__(self, pretrained_model, dropout, n_speaker, n_emotion, n_cause, n_expert, guiding_lambda, **kwargs):
+    def __set_model__(
+        self,
+        pretrained_model,
+        dropout,
+        n_speaker,
+        n_emotion,
+        n_cause,
+        n_expert,
+        guiding_lambda,
+        **kwargs,
+    ):
         self.n_cause = n_cause
 
-        model_args = {'dropout':dropout, 'n_speaker':n_speaker, 'n_emotion':n_emotion, 'n_cause':n_cause, 'n_expert':n_expert, 'guiding_lambda':guiding_lambda}
+        model_args = {
+            "dropout": dropout,
+            "n_speaker": n_speaker,
+            "n_emotion": n_emotion,
+            "n_cause": n_cause,
+            "n_expert": n_expert,
+            "guiding_lambda": guiding_lambda,
+        }
 
-        if pretrained_model != None:
+        if pretrained_model is not None:
             model = getattr(M, self.model_name)(**model_args)
             model.load_state_dict(torch.load(pretrained_model))
-            return model
         else:
             model = getattr(M, self.model_name)(**model_args)
-            
-            return model
+
+        return model
 
     def set_model(self, allocated_gpu):
         if not self.single_gpu:
             torch.distributed.init_process_group(
-                backend='gloo',
-                init_method=f'tcp://127.0.0.1:{self.port}',
+                backend="gloo",
+                init_method=f"tcp://127.0.0.1:{self.port}",
                 world_size=len(self.gpus),
-                rank=allocated_gpu)
+                rank=allocated_gpu,
+            )
 
         torch.cuda.set_device(allocated_gpu)
 
         model = self.__set_model__(**self.options).cuda(allocated_gpu)
-        
+
         if self.single_gpu:
             self.distributed_model = model
         else:
-            self.distributed_model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[allocated_gpu], find_unused_parameters=True)
+            self.distributed_model = torch.nn.parallel.DistributedDataParallel(
+                model, device_ids=[allocated_gpu], find_unused_parameters=True
+            )
 
     def set_logger_environment(self, file_name_list, logger_name_list):
         for file_name, logger_name in zip(file_name_list, logger_name_list):
@@ -86,65 +122,76 @@ class learning_env:
         logger.addHandler(stream_handler)
 
         if self.log_directory:
-            if not os.path.exists(f'log/{self.log_directory}'):
-                os.makedirs(f'log/{self.log_directory}')
-            file_handler = logging.FileHandler(f'log/{self.log_directory}/{file_name}')
-        else:
-            file_handler = logging.FileHandler(f'log/{file_name}')
+            if not os.path.exists(f'{self.log_directory}'):
+                os.makedirs(f'{self.log_directory}')
+            file_handler = logging.FileHandler(f'{self.log_directory}/{file_name}')
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
 
     def get_dataloader(self, dataset_file, batch_size, num_worker, shuffle=True, contain_context=False):
-        (utterance_input_ids_t, utterance_attention_mask_t, utterance_token_type_ids_t), speaker_t, emotion_label_t, pair_cause_label_t, pair_binary_cause_label_t = get_data(dataset_file, f"cuda:0", self.max_seq_len, contain_context)
+        device = "cuda:0"
+        data = get_data(dataset_file, device, self.max_seq_len, contain_context)
+        utterance_input_ids_t, utterance_attention_mask_t, utterance_token_type_ids_t = data[0]
+        speaker_t, emotion_label_t, pair_cause_label_t, pair_binary_cause_label_t = data[1:]
+
         dataset_ = TensorDataset(utterance_input_ids_t, utterance_attention_mask_t, utterance_token_type_ids_t, speaker_t, emotion_label_t, pair_cause_label_t, pair_binary_cause_label_t)
         
-        if self.single_gpu:
-            return DataLoader(dataset=dataset_, batch_size=batch_size, shuffle=shuffle)
-        else:
-            train_sampler = torch.utils.data.distributed.DistributedSampler(dataset=dataset_, shuffle=shuffle)
-            pin_memory = False
+        dataloader_params = {
+            "dataset": dataset_,
+            "batch_size": batch_size,
+            "shuffle": shuffle
+        }
 
-            return DataLoader(dataset=dataset_, batch_size=batch_size, pin_memory=pin_memory, num_workers=num_worker, sampler=train_sampler)
+        if not self.single_gpu:
+            train_sampler = torch.utils.data.distributed.DistributedSampler(dataset_, shuffle=shuffle)
+            dataloader_params.update({
+                "sampler": train_sampler,
+                "num_workers": num_worker,
+                "pin_memory": False
+            })
+
+        return DataLoader(**dataloader_params)
 
 
     def init_stopper(self):
         self.stopper[0] = 0
+
 
     def multiprocess_work(self, test, training_iter, batch_size, learning_rate, patience, num_worker, **kwargs):
         stopper = torch.zeros(1)
         stopper.share_memory_()
 
         if self.split_directory:
-            self.set_logger_environment([f'{self.model_name}-split_average-{self.start_time}.log'], ['split_logger'])
-            logger = logging.getLogger('split_logger')
+            self.set_logger_environment([f"{self.model_name}-split_average-{self.start_time}.log"], ["split_logger"])
+            logger = logging.getLogger("split_logger")
 
             split_performance = torch.zeros((3, len(os.listdir(self.split_directory)), 5))
             split_performance.share_memory_()
 
-            for _ in os.listdir(self.split_directory):
-                self.split_num = _.split('_')[-1]
-
-                base_file_name = os.path.join(self.split_directory, _, f"split_{_.split('_')[-1]}")
-                self.train_dataset, self.valid_dataset, self.test_dataset = base_file_name + '_train.json', base_file_name + '_valid.json', base_file_name + '_test.json'
-                
+            for split_dir in os.listdir(self.split_directory):
+                self.split_num = split_dir.split("_")[-1]
+                base_file_name = os.path.join(self.split_directory, split_dir, f"split_{self.split_num}")
+                self.train_dataset = f"{base_file_name}_train.json"
+                self.valid_dataset = f"{base_file_name}_valid.json"
+                self.test_dataset = f"{base_file_name}_test.json"
                 self.start_time = datetime.datetime.now()
 
                 if self.single_gpu:
                     self.child_process(0, training_iter, batch_size, learning_rate, patience, num_worker, stopper, split_performance, test)
                 else:
-                    torch.multiprocessing.spawn(self.child_process, nprocs=len(self.gpus), args=(training_iter, batch_size, learning_rate, patience, num_worker, stopper, split_performance, test))
-            
-            logger.info(f"Emotion Classificaiton Test Average Performance | {len(os.listdir(self.split_directory))} trials | {torch.mean(split_performance[0], dim = 0)}\n")
-            logger.info(f"Binary Cause Classificaiton Test Average Performance | {len(os.listdir(self.split_directory))} trials | {torch.mean(split_performance[1], dim = 0)}\n")
-            logger.info(f"MultiClass Cause Classificaiton Test Average Performance | {len(os.listdir(self.split_directory))} trials | {torch.mean(split_performance[2], dim = 0)}\n")
-            
+                    torch.multiprocessing.spawn(self.child_process, args=(training_iter, batch_size, learning_rate, patience, num_worker, stopper, split_performance, test), nprocs=len(self.gpus))
+
+            mean_performance = torch.mean(split_performance, dim=1)
+            logger.info(f"Emotion Classification Test Average Performance | {len(os.listdir(self.split_directory))} trials | {mean_performance[0]}\n")
+            logger.info(f"Binary Cause Classification Test Average Performance | {len(os.listdir(self.split_directory))} trials | {mean_performance[1]}\n")
+            logger.info(f"MultiClass Cause Classification Test Average Performance | {len(os.listdir(self.split_directory))} trials | {mean_performance[2]}\n")
+
         else:
             if self.single_gpu:
                 self.child_process(0, training_iter, batch_size, learning_rate, patience, num_worker, stopper, None, test)
             else:
-                torch.multiprocessing.spawn(self.child_process, nprocs=len(self.gpus), args=(training_iter, batch_size, learning_rate, patience, num_worker, stopper, None, test))
+                torch.multiprocessing.spawn(self.child_process, args=(training_iter, batch_size, learning_rate, patience, num_worker, stopper, None, test), nprocs=len(self.gpus))
 
-    # ##############################################################################################################################################################################################
 
     def child_process(self, allocated_gpu, training_iter, batch_size, learning_rate, patience, num_worker, stopper, split_performance, test=False):
         batch_size = int(batch_size / len(self.gpus))
@@ -156,9 +203,9 @@ class learning_env:
             logger_name_list = ['train', 'valid', 'test']
 
             if self.n_cause == 2:
-                file_name_list = [f'{self.model_name}-binary_cause-{_}-{self.start_time}.log' for _ in ['train', 'valid', 'test']]
+                file_name_list = [f'{self.model_name}-binary_cause-{_}-{self.start_time}.log' for _ in logger_name_list]
             else:
-                file_name_list = [f'{self.model_name}-multiclass_cause-{_}-{self.start_time}.log' for _ in ['train', 'valid', 'test']]
+                file_name_list = [f'{self.model_name}-multiclass_cause-{_}-{self.start_time}.log' for _ in logger_name_list]
 
             self.set_logger_environment(file_name_list, logger_name_list)
 
@@ -175,56 +222,48 @@ class learning_env:
         if not self.single_gpu:
             torch.distributed.barrier()
 
+
     def train(self, allocated_gpu, training_iter, batch_size, learning_rate, patience, num_worker):
         def get_pad_idx(utterance_input_ids_batch):
             batch_size, max_doc_len, max_seq_len = utterance_input_ids_batch.shape
-
             check_pad_idx = torch.sum(utterance_input_ids_batch.view(-1, max_seq_len)[:, 2:], dim=1).cpu()
 
             return check_pad_idx
 
         def get_pair_pad_idx(utterance_input_ids_batch, window_constraint=3, emotion_pred=None):
             batch_size, max_doc_len, max_seq_len = utterance_input_ids_batch.shape
+            
             check_pad_idx = get_pad_idx(utterance_input_ids_batch)
 
-            if emotion_pred != None:
+            if emotion_pred is not None:
                 emotion_pred = torch.argmax(emotion_pred, dim=1)
                 
-                check_pair_window_idx = list()
-                for batch in check_pad_idx.view(-1, max_doc_len):
-                    pair_window_idx = torch.zeros(int(max_doc_len * (max_doc_len + 1) / 2))
-                    for end_t in range(1, len(batch.nonzero()) + 1):
-                        if emotion_pred[end_t - 1] == 6:
-                            continue
-                        
-                        pair_window_idx[max(0, int(end_t * (end_t + 1) / 2) - window_constraint):int(end_t * (end_t + 1) / 2)] = 1
-                    check_pair_window_idx.append(pair_window_idx)
-                check_pair_window_idx = torch.stack(check_pair_window_idx)
-
-                return check_pair_window_idx
-            else:
-                check_pair_window_idx = list()
-                for batch in check_pad_idx.view(-1, max_doc_len):
-                    pair_window_idx = torch.zeros(int(max_doc_len * (max_doc_len + 1) / 2))
-                    for end_t in range(1, len(batch.nonzero()) + 1):
-                        pair_window_idx[max(0, int(end_t * (end_t + 1) / 2) - window_constraint):int(end_t * (end_t + 1) / 2)] = 1
-                    check_pair_window_idx.append(pair_window_idx)
-                check_pair_window_idx = torch.stack(check_pair_window_idx)
-
-                return check_pair_window_idx
+            check_pair_window_idx = list()
+            for batch in check_pad_idx.view(-1, max_doc_len):
+                pair_window_idx = torch.zeros(int(max_doc_len * (max_doc_len + 1) / 2))
+                for end_t in range(1, len(batch.nonzero()) + 1):
+                    if emotion_pred is not None and emotion_pred[end_t - 1] == 6:
+                        continue
+                    
+                    pair_window_idx[max(0, int(end_t * (end_t + 1) / 2) - window_constraint):int(end_t * (end_t + 1) / 2)] = 1
+                check_pair_window_idx.append(pair_window_idx)
+            
+            return torch.stack(check_pair_window_idx)
 
         if allocated_gpu == 0:
-
             self.init_stopper()
-
             logger = logging.getLogger('train')
 
         optimizer = optim.Adam(self.distributed_model.parameters(), lr=learning_rate)
 
         if self.n_cause == 2:
-            saver = model_saver(path=f"model/{self.model_name}-binary_cause-{self.data_label}-{self.start_time}.pt", single_gpu=self.single_gpu)
+            model_name_suffix = 'binary_cause'
         else:
-            saver = model_saver(path=f"model/{self.model_name}-multiclass_cause-{self.data_label}-{self.start_time}.pt", single_gpu=self.single_gpu)
+            model_name_suffix = 'multiclass_cause'
+
+        if not os.path.exists("model/"):
+            os.makedirs("model/")
+        saver = ModelSaver(path=f"model/{self.model_name}-{model_name_suffix}-{self.data_label}-{self.start_time}.pt", single_gpu=self.single_gpu)
 
         scheduler = optim.lr_scheduler.LambdaLR(optimizer=optimizer,
                                                 lr_lambda=lambda epoch: 0.95 ** epoch,
@@ -244,15 +283,27 @@ class learning_env:
                 
                 check_pad_idx = get_pad_idx(utterance_input_ids_batch)
 
-                prediction = self.distributed_model(utterance_input_ids_batch, utterance_attention_mask_batch, utterance_token_type_ids_batch, speaker_batch)
+                prediction = self.distributed_model(
+                                                    utterance_input_ids_batch, 
+                                                    utterance_attention_mask_batch, 
+                                                    utterance_token_type_ids_batch, 
+                                                    speaker_batch
+                                                    )
 
                 if len(prediction) != 2:
                     emotion_prediction, binary_cause_prediction = prediction
                 else:
                     emotion_prediction, binary_cause_prediction = prediction
                 
-                check_pair_window_idx = get_pair_pad_idx(utterance_input_ids_batch, window_constraint=3, emotion_pred=emotion_prediction)
-                check_pair_pad_idx = get_pair_pad_idx(utterance_input_ids_batch, window_constraint=1000)
+                check_pair_window_idx = get_pair_pad_idx(
+                                                        utterance_input_ids_batch, 
+                                                        window_constraint=3, 
+                                                        emotion_pred=emotion_prediction
+                                                        )
+                check_pair_pad_idx = get_pair_pad_idx(
+                                                    utterance_input_ids_batch, 
+                                                    window_constraint=1000
+                                                    )
 
                 emotion_prediction = emotion_prediction[(check_pad_idx != False).nonzero(as_tuple=True)]
                 binary_cause_prediction_window = binary_cause_prediction.view(batch_size, -1, self.n_cause)[(check_pair_window_idx != False).nonzero(as_tuple=True)]
@@ -281,60 +332,17 @@ class learning_env:
                 optimizer.step()
 
                 cau_pred_y_list_all.append(binary_cause_prediction_all), cau_true_y_list_all.append(pair_binary_cause_label_batch_all)
-
                 cau_pred_y_list.append(binary_cause_prediction_window), cau_true_y_list.append(pair_binary_cause_label_batch_window)
-
                 emo_pred_y_list.append(emotion_prediction), emo_true_y_list.append(emotion_label_batch)
 
-                loss_avg = loss_avg + loss.item(); count += 1
+                loss_avg += loss.item()
+                count += 1
 
             loss_avg = loss_avg / count
 
             # Logging Performance
             if allocated_gpu == 0:
-                label_ = np.array(['angry', 'disgust', 'fear', 'happy', 'sad', 'surprise', 'neutral'])
-                logger.info('\n' + metrics_report(torch.cat(emo_pred_y_list), torch.cat(emo_true_y_list), label=label_))
-                report_dict = metrics_report(torch.cat(emo_pred_y_list), torch.cat(emo_true_y_list), label=label_, get_dict=True)
-                acc_emo, p_emo, r_emo, f1_emo = report_dict['accuracy'], report_dict['weighted avg']['precision'], report_dict['weighted avg']['recall'], report_dict['weighted avg']['f1-score']
-                logger.info(f'\nemotion: train | loss {loss_avg}\n')
-
-                if self.n_cause == 2:
-                    label_ = np.array(['No Cause', 'Cause'])
-
-                    report_dict = metrics_report(torch.cat(cau_pred_y_list), torch.cat(cau_true_y_list), label=label_, get_dict=True)
-                    _, p_cau, _, _ = report_dict['accuracy'], report_dict['Cause']['precision'], report_dict['Cause']['recall'], report_dict['Cause']['f1-score']
-
-                    report_dict = metrics_report(torch.cat(cau_pred_y_list_all), torch.cat(cau_true_y_list_all), label=label_, get_dict=True)
-                    acc_cau, _, r_cau, _ = report_dict['accuracy'], report_dict['Cause']['precision'], report_dict['Cause']['recall'], report_dict['Cause']['f1-score']
-
-                    f1_cau = 2 * p_cau * r_cau / (p_cau + r_cau) if p_cau + r_cau != 0 else 0
-                    logger.info(f'\nbinary_cause: train | loss {loss_avg}\n')
-                    logger.info(f'\nbinary_cause: accuracy: {acc_cau} | precision: {p_cau} | recall: {r_cau} | f1-score: {f1_cau}\n')
-                else:
-                    label_ = np.array(['no-context', 'inter-personal', 'self-contagion', 'no cause'])
-                    report_dict = metrics_report(torch.cat(cau_pred_y_list), torch.cat(cau_true_y_list), label=label_, get_dict=True)
-
-                    p_no_context, p_inter_personal, p_self_contagion = report_dict['no-context']['precision'], report_dict['inter-personal']['precision'], report_dict['self-contagion']['precision']
-
-                    p_cau = (report_dict['no-context']['support'] * report_dict['no-context']['precision'] + report_dict['inter-personal']['support'] * report_dict['inter-personal']['precision'] + report_dict['self-contagion']['support'] * report_dict['self-contagion']['precision']) / \
-                            (report_dict['no-context']['support'] + report_dict['inter-personal']['support'] + report_dict['self-contagion']['support'] )
-                    report_dict = metrics_report(torch.cat(cau_pred_y_list_all), torch.cat(cau_true_y_list_all), label=label_, get_dict=True)
-
-                    r_no_context, r_inter_personal, r_self_contagion = report_dict['no-context']['recall'], report_dict['inter-personal']['recall'], report_dict['self-contagion']['recall']
-
-                    acc_cau = report_dict['accuracy']
-                    r_cau = (report_dict['no-context']['support'] * report_dict['no-context']['recall'] + report_dict['inter-personal']['support'] * report_dict['inter-personal']['recall'] + report_dict['self-contagion']['support'] * report_dict['self-contagion']['recall']) / \
-                            (report_dict['no-context']['support'] + report_dict['inter-personal']['support'] + report_dict['self-contagion']['support'] )
-
-                    f1_cau = 2 * p_cau * r_cau / (p_cau + r_cau) if p_cau + r_cau != 0 else 0
-                    logger.info(f'\nmulticlass_cause: train | loss {loss_avg}\n')
-
-                    logger.info(f'\nmulticlass_cause: no-context    | precision: {p_no_context} | recall: {r_no_context} | f1-score: {2 * p_no_context * r_no_context / (p_no_context + r_no_context) if p_no_context + r_no_context != 0 else 0}\n')
-                    logger.info(f'multiclass_cause: inter-personal  | precision: {p_inter_personal} | recall: {r_inter_personal} | f1-score: {2 * p_inter_personal * r_inter_personal / (p_inter_personal + r_inter_personal) if p_inter_personal + r_inter_personal != 0 else 0}\n')
-                    logger.info(f'multiclass_cause: self-contagion  | precision: {p_self_contagion} | recall: {r_self_contagion} | f1-score: {2 * p_self_contagion * r_self_contagion / (p_self_contagion + r_self_contagion) if p_self_contagion + r_self_contagion != 0 else 0}\n')
-
-                    logger.info(f'\nmulticlass_cause: accuracy: {acc_cau} | precision: {p_cau} | recall: {r_cau} | f1-score: {f1_cau}\n')
-
+                p_cau, r_cau, f1_cau = log_metrics(logger, emo_pred_y_list, emo_true_y_list, cau_pred_y_list, cau_true_y_list, cau_pred_y_list_all, cau_true_y_list_all, loss_avg, n_cause=self.n_cause, option='train')
             self.valid(allocated_gpu, batch_size, num_worker, saver)
             
             if not self.single_gpu:
@@ -350,41 +358,29 @@ class learning_env:
     def valid(self, allocated_gpu, batch_size, num_worker, saver=None, option='valid'):
         def get_pad_idx(utterance_input_ids_batch):
             batch_size, max_doc_len, max_seq_len = utterance_input_ids_batch.shape
-
             check_pad_idx = torch.sum(utterance_input_ids_batch.view(-1, max_seq_len)[:, 2:], dim=1).cpu()
 
             return check_pad_idx
 
         def get_pair_pad_idx(utterance_input_ids_batch, window_constraint=3, emotion_pred=None):
             batch_size, max_doc_len, max_seq_len = utterance_input_ids_batch.shape
+            
             check_pad_idx = get_pad_idx(utterance_input_ids_batch)
 
-            if emotion_pred != None:
+            if emotion_pred is not None:
                 emotion_pred = torch.argmax(emotion_pred, dim=1)
                 
-                check_pair_window_idx = list()
-                for batch in check_pad_idx.view(-1, max_doc_len):
-                    pair_window_idx = torch.zeros(int(max_doc_len * (max_doc_len + 1) / 2))
-
-                    for end_t in range(1, len(batch.nonzero()) + 1):
-                        if emotion_pred[end_t - 1] == 6:
-                            continue
-                        pair_window_idx[max(0, int(end_t * (end_t + 1) / 2) - window_constraint):int(end_t * (end_t + 1) / 2)] = 1
-                    check_pair_window_idx.append(pair_window_idx)
-                check_pair_window_idx = torch.stack(check_pair_window_idx)
-
-                return check_pair_window_idx
-            else:
-                check_pair_window_idx = list()
-                for batch in check_pad_idx.view(-1, max_doc_len):
-                    pair_window_idx = torch.zeros(int(max_doc_len * (max_doc_len + 1) / 2))
-
-                    for end_t in range(1, len(batch.nonzero()) + 1):
-                        pair_window_idx[max(0, int(end_t * (end_t + 1) / 2) - window_constraint):int(end_t * (end_t + 1) / 2)] = 1
-                    check_pair_window_idx.append(pair_window_idx)
-                check_pair_window_idx = torch.stack(check_pair_window_idx)
-
-                return check_pair_window_idx
+            check_pair_window_idx = list()
+            for batch in check_pad_idx.view(-1, max_doc_len):
+                pair_window_idx = torch.zeros(int(max_doc_len * (max_doc_len + 1) / 2))
+                for end_t in range(1, len(batch.nonzero()) + 1):
+                    if emotion_pred is not None and emotion_pred[end_t - 1] == 6:
+                        continue
+                    
+                    pair_window_idx[max(0, int(end_t * (end_t + 1) / 2) - window_constraint):int(end_t * (end_t + 1) / 2)] = 1
+                check_pair_window_idx.append(pair_window_idx)
+            
+            return torch.stack(check_pair_window_idx)
 
 
         if allocated_gpu == 0:
@@ -407,15 +403,27 @@ class learning_env:
 
                 check_pad_idx = get_pad_idx(utterance_input_ids_batch)
 
-                prediction = self.distributed_model(utterance_input_ids_batch, utterance_attention_mask_batch, utterance_token_type_ids_batch, speaker_batch)
+                prediction = self.distributed_model(
+                                                    utterance_input_ids_batch, 
+                                                    utterance_attention_mask_batch, 
+                                                    utterance_token_type_ids_batch, 
+                                                    speaker_batch
+                                                    )
 
                 if len(prediction) != 2:
                     emotion_prediction, binary_cause_prediction = prediction
                 else:
                     emotion_prediction, binary_cause_prediction = prediction
 
-                check_pair_window_idx = get_pair_pad_idx(utterance_input_ids_batch, window_constraint=3, emotion_pred=emotion_prediction)
-                check_pair_pad_idx = get_pair_pad_idx(utterance_input_ids_batch, window_constraint=1000)
+                check_pair_window_idx = get_pair_pad_idx(
+                                                        utterance_input_ids_batch, 
+                                                        window_constraint=3, 
+                                                        emotion_pred=emotion_prediction
+                                                        )
+                check_pair_pad_idx = get_pair_pad_idx(
+                                                    utterance_input_ids_batch, 
+                                                    window_constraint=1000
+                                                    )
 
                 emotion_prediction = emotion_prediction[(check_pad_idx != False).nonzero(as_tuple=True)]
                 binary_cause_prediction_window = binary_cause_prediction.view(batch_size, -1, self.n_cause)[(check_pair_window_idx != False).nonzero(as_tuple=True)]
@@ -444,57 +452,13 @@ class learning_env:
                 cau_pred_y_list.append(binary_cause_prediction_window), cau_true_y_list.append(pair_binary_cause_label_batch_window)
                 emo_pred_y_list.append(emotion_prediction), emo_true_y_list.append(emotion_label_batch)
 
-                loss_avg = loss_avg + loss.item(); count += 1
+                loss_avg += loss.item()
+                count += 1
 
             loss_avg = loss_avg / count
+
             if allocated_gpu == 0:
-                label_ = np.array(['angry', 'disgust', 'fear', 'happy', 'sad', 'surprise', 'neutral'])
-                logger.info('\n' + metrics_report(torch.cat(emo_pred_y_list), torch.cat(emo_true_y_list), label=label_))
-                report_dict = metrics_report(torch.cat(emo_pred_y_list), torch.cat(emo_true_y_list), label=label_, get_dict=True)
-                acc_emo, p_emo, r_emo, f1_emo = report_dict['accuracy'], report_dict['weighted avg']['precision'], report_dict['weighted avg']['recall'], report_dict['weighted avg']['f1-score']
-                logger.info(f'\nemotion: {option} | loss {loss_avg}\n')
-
-                if self.n_cause == 2:
-                    label_ = np.array(['No Cause', 'Cause'])
-
-                    report_dict = metrics_report(torch.cat(cau_pred_y_list), torch.cat(cau_true_y_list), label=label_, get_dict=True)
-                    _, p_cau, _, _ = report_dict['accuracy'], report_dict['Cause']['precision'], report_dict['Cause']['recall'], report_dict['Cause']['f1-score']
-
-                    report_dict = metrics_report(torch.cat(cau_pred_y_list_all), torch.cat(cau_true_y_list_all), label=label_, get_dict=True)
-                    acc_cau, _, r_cau, _ = report_dict['accuracy'], report_dict['Cause']['precision'], report_dict['Cause']['recall'], report_dict['Cause']['f1-score']
-
-                    f1_cau = 2 * p_cau * r_cau / (p_cau + r_cau) if p_cau + r_cau != 0 else 0
-                    logger.info(f'\nbinary_cause: valid | loss {loss_avg}\n')
-                    logger.info(f'\nbinary_cause: accuracy: {acc_cau} | precision: {p_cau} | recall: {r_cau} | f1-score: {f1_cau}\n')
-                else:
-                    label_ = np.array(['no-context', 'inter-personal', 'self-contagion', 'no cause'])
-                    report_dict = metrics_report(torch.cat(cau_pred_y_list), torch.cat(cau_true_y_list), label=label_, get_dict=True)
-
-                    p_no_context, p_inter_personal, p_self_contagion = report_dict['no-context']['precision'], report_dict['inter-personal']['precision'], report_dict['self-contagion']['precision']
-
-                    p_cau = (report_dict['no-context']['support'] * report_dict['no-context']['precision'] + report_dict['inter-personal']['support'] * report_dict['inter-personal']['precision'] + report_dict['self-contagion']['support'] * report_dict['self-contagion']['precision']) / \
-                            (report_dict['no-context']['support'] + report_dict['inter-personal']['support'] + report_dict['self-contagion']['support'] )
-
-                    report_dict = metrics_report(torch.cat(cau_pred_y_list_all), torch.cat(cau_true_y_list_all), label=label_, get_dict=True)
-
-                    r_no_context, r_inter_personal, r_self_contagion = report_dict['no-context']['recall'], report_dict['inter-personal']['recall'], report_dict['self-contagion']['recall']
-
-                    acc_cau = report_dict['accuracy']
-                    r_cau = (report_dict['no-context']['support'] * report_dict['no-context']['recall'] + report_dict['inter-personal']['support'] * report_dict['inter-personal']['recall'] + report_dict['self-contagion']['support'] * report_dict['self-contagion']['recall']) / \
-                            (report_dict['no-context']['support'] + report_dict['inter-personal']['support'] + report_dict['self-contagion']['support'] )
-
-                    f1_cau = 2 * p_cau * r_cau / (p_cau + r_cau) if p_cau + r_cau != 0 else 0
-                    logger.info(f'\nmulticlass_cause: valid | loss {loss_avg}\n')
-
-                    logger.info(f'\nmulticlass_cause: no-context    | precision: {p_no_context} | recall: {r_no_context} | f1-score: {2 * p_no_context * r_no_context / (p_no_context + r_no_context) if p_no_context + r_no_context != 0 else 0}\n')
-                    logger.info(f'multiclass_cause: inter-personal  | precision: {p_inter_personal} | recall: {r_inter_personal} | f1-score: {2 * p_inter_personal * r_inter_personal / (p_inter_personal + r_inter_personal) if p_inter_personal + r_inter_personal != 0 else 0}\n')
-                    logger.info(f'multiclass_cause: self-contagion  | precision: {p_self_contagion} | recall: {r_self_contagion} | f1-score: {2 * p_self_contagion * r_self_contagion / (p_self_contagion + r_self_contagion) if p_self_contagion + r_self_contagion != 0 else 0}\n')
-
-                    logger.info(f'\nmulticlass_cause: accuracy: {acc_cau} | precision: {p_cau} | recall: {r_cau} | f1-score: {f1_cau}\n')
-
-            if not self.single_gpu:
-                torch.distributed.barrier()
-
+                p_cau, r_cau, f1_cau = log_metrics(logger, emo_pred_y_list, emo_true_y_list, cau_pred_y_list, cau_true_y_list, cau_pred_y_list_all, cau_true_y_list_all, loss_avg, n_cause=self.n_cause, option=option)
             del valid_dataloader
 
             if option == 'valid' and allocated_gpu == 0:
@@ -517,21 +481,18 @@ class learning_env:
         with torch.no_grad(): 
             self.distributed_model.eval()
             
-            utterance_input_ids, utterance_attention_mask, utterance_token_type_ids, speaker_info = tokenize_conversation(conversation, 0, self.max_seq_len)
-
-            # Running Model
-            emotion_prediction, binary_cause_prediction = self.distributed_model(utterance_input_ids, utterance_attention_mask, utterance_token_type_ids, speaker_info)
+            # inputs: (utterance_input_ids, utterance_attention_mask, utterance_token_type_ids, speaker_info)
+            inputs = tokenize_conversation(conversation, 0, self.max_seq_len)
+            emotion_prediction, binary_cause_prediction = self.distributed_model(*inputs)
 
         return emotion_prediction, binary_cause_prediction
 
 
-class model_saver:
+class ModelSaver:
     def __init__(self, path='checkpoint.pt', single_gpu=None):
         self.path = path
         self.single_gpu = single_gpu
 
     def __call__(self, model):
-        if self.single_gpu:
-            torch.save(model.state_dict(), self.path)
-        else:
-            torch.save(model.module.state_dict(), self.path)
+        state_dict = model.module.state_dict() if not self.single_gpu else model.state_dict()
+        torch.save(state_dict, self.path)

@@ -1,8 +1,6 @@
-import numpy as np
-import torch
 import json
+import torch
 from transformers import BertTokenizer
-from torch.nn.utils.rnn import pad_sequence
 
 def get_data(data_file, device, max_seq_len, contain_context=False):
     f = open(data_file)
@@ -205,7 +203,6 @@ def load_utterance_with_context(data_file, device, max_seq_len):
 
     out_utterance_input_ids, out_utterance_attention_mask, out_utterance_token_type_ids = torch.stack(out_utterance_input_ids), torch.stack(out_utterance_attention_mask), torch.stack(out_utterance_token_type_ids)
     return (out_utterance_input_ids.to(device), out_utterance_attention_mask.to(device), out_utterance_token_type_ids.to(device)), max_doc_len, max_seq_len
-
 
 def tokenize_conversation(conversation, device, max_seq_len):
     tokenizer_ = BertTokenizer.from_pretrained('bert-base-cased')

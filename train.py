@@ -74,9 +74,52 @@ def main():
 
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join([str(_) for _ in args.gpus])
 
+    train_data_list = [
+        'data/data_fold/data_0/dailydialog_train.json',
+        * [f'data/data_fold/data_{fold_}/data_{fold_}_train.json' for fold_ in range(1, 5)]
+    ]
+    valid_data_list = [
+        'data/data_fold/data_0/dailydialog_valid.json',
+        * [f'data/data_fold/data_{fold_}/data_{fold_}_valid.json' for fold_ in range(1, 5)]
+    ]
+    test_data_list = [
+        'data/data_fold/data_0/dailydialog_test.json',
+        * [f'data/data_fold/data_{fold_}/data_{fold_}_test.json' for fold_ in range(1, 5)]
+    ]
+    data_label = ['-original_data_DailyDialog', *[f'-data_{fold_}_DailyDialog' for fold_ in range(1, 5)]]
 
-    trainer = LearningEnv(**vars(args))
-    trainer.run(**vars(args))
+    model_name_list = ['PRG_MoE']
+    log_directory_list = ['logs/train_PRG_MoE']
+
+    for tr, va, te, dl in zip(train_data_list, valid_data_list, test_data_list, data_label):
+        args.train_data, args.valid_data, args.test_data, args.data_label = tr, va, te, dl
+
+        for mo, log_d in zip(model_name_list, log_directory_list):
+            args.model_name = mo
+            args.log_directory = log_d + dl
+
+            trainer = LearningEnv(**vars(args))
+            trainer.run(**vars(args))
+
+            del trainer
+
+    train_data_list = [f'data_fold_test_IEMOCAP/data_{fold_}/data_{fold_}_train.json' for fold_ in range(0, 5)]
+    valid_data_list = [f'data_fold_test_IEMOCAP/data_{fold_}/data_{fold_}_valid.json' for fold_ in range(0, 5)]
+    test_data_list = [f'data_fold_test_IEMOCAP/data_{fold_}/data_{fold_}_test.json' for fold_ in range(0, 5)]
+    data_label = [f'-data_{fold_}_IEMOCAP' for fold_ in range(0, 5)]
+
+    for tr, va, te, dl in zip(train_data_list, valid_data_list, test_data_list, data_label):
+        args.train_data, args.valid_data, args.test_data, args.data_label = tr, va, te, dl
+
+        for mo, log_d in zip(model_name_list, log_directory_list):
+            args.model_name = mo
+            args.log_directory = log_d + dl
+
+            trainer = LearningEnv(**vars(args))
+            trainer.run(**vars(args))
+
+            del trainer
+
 
 if __name__ == "__main__":
     main()
