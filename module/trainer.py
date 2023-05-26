@@ -324,8 +324,12 @@ class LearningEnv:
                 criterion_cau = FocalLoss(gamma=2)
 
                 loss_emo = criterion_emo(emotion_prediction, emotion_label_batch.to(allocated_gpu))
-                loss_cau = criterion_cau(binary_cause_prediction_window, pair_binary_cause_label_batch_window.to(allocated_gpu))
-                loss = 0.2 * loss_emo + 0.8 * loss_cau
+                
+                if torch.sum(check_pair_window_idx) == 0:
+                    loss = loss_emo
+                else:
+                    loss_cau = criterion_cau(binary_cause_prediction_window, pair_binary_cause_label_batch_window.to(allocated_gpu))
+                    loss = 0.2 * loss_emo + 0.8 * loss_cau
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -444,9 +448,12 @@ class LearningEnv:
                 criterion_cau = FocalLoss(gamma=2)
 
                 loss_emo = criterion_emo(emotion_prediction, emotion_label_batch.to(allocated_gpu))
-                loss_cau = criterion_cau(binary_cause_prediction_window, pair_binary_cause_label_batch_window.to(allocated_gpu))
-
-                loss = 0.2 * loss_emo + 0.8 * loss_cau
+                
+                if torch.sum(check_pair_window_idx) == 0:
+                    loss = loss_emo
+                else:
+                    loss_cau = criterion_cau(binary_cause_prediction_window, pair_binary_cause_label_batch_window.to(allocated_gpu))
+                    loss = 0.2 * loss_emo + 0.8 * loss_cau
 
                 cau_pred_y_list_all.append(binary_cause_prediction_all), cau_true_y_list_all.append(pair_binary_cause_label_batch_all)
                 cau_pred_y_list.append(binary_cause_prediction_window), cau_true_y_list.append(pair_binary_cause_label_batch_window)
