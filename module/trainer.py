@@ -245,7 +245,7 @@ class LearningEnv:
                     if emotion_pred is not None and emotion_pred[end_t - 1] == 6:
                         continue
                     
-                    pair_window_idx[max(0, int((ent_t - 1) * end_t) / 2), int(end_t * (end_t + 1) / 2) - window_constraint):int(end_t * (end_t + 1) / 2)] = 1
+                    pair_window_idx[max(0, int((end_t - 1) * end_t) / 2), int(end_t * (end_t + 1) / 2) - window_constraint):int(end_t * (end_t + 1) / 2)] = 1
                 check_pair_window_idx.append(pair_window_idx)
             
             return torch.stack(check_pair_window_idx)
@@ -381,7 +381,7 @@ class LearningEnv:
                     if emotion_pred is not None and emotion_pred[end_t - 1] == 6:
                         continue
                     
-                    pair_window_idx[max(0, int((ent_t - 1) * end_t) / 2), int(end_t * (end_t + 1) / 2) - window_constraint):int(end_t * (end_t + 1) / 2)] = 1
+                    pair_window_idx[max(0, int((end_t - 1) * end_t) / 2), int(end_t * (end_t + 1) / 2) - window_constraint):int(end_t * (end_t + 1) / 2)] = 1
                 check_pair_window_idx.append(pair_window_idx)
             
             return torch.stack(check_pair_window_idx)
