@@ -31,4 +31,6 @@ The dataset used in this paper is RECCON dataset. See [this link](https://github
 
 ## Citation
 
-TBD
+```
+DongJin Jeong and JinYeong Bak. 2023. Conversational Emotion-Cause Pair Extraction with Guided Mixture of Experts. In Proceedings of the 17th Conference of the European Chapter of the Association for Computational Linguistics, pages 3288–3298, Dubrovnik, Croatia. Association for Computational Linguistics.
+```
